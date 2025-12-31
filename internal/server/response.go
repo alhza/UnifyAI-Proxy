@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"log/slog"
 	"net/http"
 )
 
@@ -22,34 +23,52 @@ type ErrorDetail struct {
 func WriteJSON(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(data)
+	if err := json.NewEncoder(w).Encode(data); err != nil {
+		slog.Error("failed to encode JSON response",
+			"error", err,
+			"status", status,
+		)
+	}
 }
 
 // WriteError writes an error response in OpenAI-compatible format
 func WriteError(w http.ResponseWriter, status int, code, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(ErrorResponse{
+	if err := json.NewEncoder(w).Encode(ErrorResponse{
 		Error: ErrorDetail{
 			Message: message,
 			Type:    getErrorType(status),
 			Code:    code,
 		},
-	})
+	}); err != nil {
+		slog.Error("failed to encode error response",
+			"error", err,
+			"status", status,
+			"code", code,
+		)
+	}
 }
 
 // WriteErrorWithParam writes an error with parameter information
 func WriteErrorWithParam(w http.ResponseWriter, status int, code, message, param string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(ErrorResponse{
+	if err := json.NewEncoder(w).Encode(ErrorResponse{
 		Error: ErrorDetail{
 			Message: message,
 			Type:    getErrorType(status),
 			Code:    code,
 			Param:   &param,
 		},
-	})
+	}); err != nil {
+		slog.Error("failed to encode error response with param",
+			"error", err,
+			"status", status,
+			"code", code,
+			"param", param,
+		)
+	}
 }
 
 // getErrorType returns the error type based on status code

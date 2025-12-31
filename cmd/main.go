@@ -116,6 +116,7 @@ func main() {
 	// Initialize providers and transformers with config
 	handlers := server.NewHandlersWithConfig(server.HandlersConfig{
 		MaxRequestSize:  cfg.MaxRequestSize,
+		MaxEventSize:    cfg.MaxEventSize,
 		AccountSelector: accountSelector,
 	})
 	if err := setupProviders(ctx, cfg, tokenStore, handlers); err != nil {
@@ -133,6 +134,19 @@ func main() {
 	var middlewares []server.Middleware
 	middlewares = append(middlewares, server.RecoveryMiddleware(slog.Default()))
 	middlewares = append(middlewares, server.LoggingMiddleware(slog.Default()))
+
+	// Apply rate limiting middleware if enabled
+	var rateLimiter *server.RateLimiter
+	if cfg.RateLimit.Enabled {
+		rateLimiter = server.NewRateLimiter(
+			cfg.RateLimit.RequestsPerSecond,
+			cfg.RateLimit.BurstSize,
+		)
+		middlewares = append(middlewares, rateLimiter.Middleware())
+		slog.Info("Rate limiting enabled",
+			"requests_per_second", cfg.RateLimit.RequestsPerSecond,
+			"burst_size", cfg.RateLimit.BurstSize)
+	}
 
 	// Apply auth middleware if API keys are configured
 	if len(apiKeys) > 0 {
@@ -164,10 +178,18 @@ func main() {
 	case <-ctx.Done():
 	}
 
-	// Graceful shutdown
+	// Graceful shutdown with timeout
 	slog.Info("Shutting down...")
-	if err := srv.Stop(ctx); err != nil {
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer shutdownCancel()
+
+	if err := srv.Stop(shutdownCtx); err != nil {
 		slog.Error("Server shutdown error", "error", err)
+	}
+
+	// Stop rate limiter cleanup goroutine if enabled
+	if rateLimiter != nil {
+		rateLimiter.Stop()
 	}
 
 	refreshService.Stop()
@@ -225,7 +247,7 @@ func handleLogin(providerName string, store auth.Store) error {
 }
 
 // setupProviders initializes and registers providers and transformers
-func setupProviders(ctx context.Context, cfg *config.Config, tokenStore auth.Store, handlers *server.Handlers) error {
+func setupProviders(_ context.Context, cfg *config.Config, tokenStore auth.Store, handlers *server.Handlers) error {
 	// Default provider configuration
 	defaultConfig := provider.ProviderConfig{
 		Timeout:    30,

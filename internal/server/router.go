@@ -1,7 +1,6 @@
 package server
 
 import (
-	"context"
 	"net/http"
 	"strings"
 	"sync"
@@ -171,7 +170,3 @@ func (g *Group) GET(path string, handler http.HandlerFunc) {
 func (g *Group) POST(path string, handler http.HandlerFunc) {
 	g.Handle(http.MethodPost, path, handler)
 }
-
-// Unused import guard
-var _ = context.Background
-

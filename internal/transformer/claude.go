@@ -1,10 +1,10 @@
 package transformer
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/unifyai-proxy/unifyai-proxy/internal/provider"
@@ -13,6 +13,11 @@ import (
 // ClaudeTransformer transforms OpenAI format to/from Claude format
 type ClaudeTransformer struct {
 	defaultMaxTokens int
+	// Stream context - ensures consistent id and model across all chunks in a stream
+	streamID      string
+	streamModel   string
+	streamCreated int64
+	mu            sync.Mutex
 }
 
 // NewClaudeTransformer creates a new Claude transformer
@@ -20,6 +25,32 @@ func NewClaudeTransformer() *ClaudeTransformer {
 	return &ClaudeTransformer{
 		defaultMaxTokens: provider.DefaultMaxTokens,
 	}
+}
+
+// SetStreamContext sets the context for a streaming session.
+// This ensures id and model are consistent across all chunks in the stream.
+func (t *ClaudeTransformer) SetStreamContext(model string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.streamID = fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
+	t.streamModel = model
+	t.streamCreated = time.Now().Unix()
+}
+
+// ClearStreamContext clears the streaming context after a stream completes
+func (t *ClaudeTransformer) ClearStreamContext() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.streamID = ""
+	t.streamModel = ""
+	t.streamCreated = 0
+}
+
+// getStreamContext returns the current stream context (thread-safe)
+func (t *ClaudeTransformer) getStreamContext() (string, string, int64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.streamID, t.streamModel, t.streamCreated
 }
 
 // ProviderType returns the target provider type
@@ -382,15 +413,31 @@ func (t *ClaudeTransformer) mapStopReason(reason string) string {
 
 // TransformStreamEvent transforms Claude stream event to OpenAI format
 func (t *ClaudeTransformer) TransformStreamEvent(event interface{}) (*OpenAIStreamChunk, error) {
+	// Get stable stream context for consistent id/model across all chunks
+	streamID, streamModel, streamCreated := t.getStreamContext()
+
 	chunk := &OpenAIStreamChunk{
 		Object:  "chat.completion.chunk",
-		Created: time.Now().Unix(),
+		Created: streamCreated,
+	}
+	// Use stream context if set, otherwise fall back to per-chunk values
+	if streamCreated == 0 {
+		chunk.Created = time.Now().Unix()
 	}
 
 	switch e := event.(type) {
 	case *provider.ClaudeMessageStart:
-		chunk.ID = e.Message.ID
-		chunk.Model = e.Message.Model
+		// Use stream context id/model if set, otherwise use from event
+		if streamID != "" {
+			chunk.ID = streamID
+		} else {
+			chunk.ID = e.Message.ID
+		}
+		if streamModel != "" {
+			chunk.Model = streamModel
+		} else {
+			chunk.Model = e.Message.Model
+		}
 		chunk.Choices = []Choice{
 			{
 				Index: 0,
@@ -399,6 +446,9 @@ func (t *ClaudeTransformer) TransformStreamEvent(event interface{}) (*OpenAIStre
 		}
 
 	case *provider.ClaudeContentBlockStart:
+		// Apply stream context for consistent id/model
+		chunk.ID = streamID
+		chunk.Model = streamModel
 		if e.ContentBlock.Type == "tool_use" {
 			// Tool call start - include index so clients can track multiple parallel tool calls
 			toolCallIndex := e.Index
@@ -428,6 +478,9 @@ func (t *ClaudeTransformer) TransformStreamEvent(event interface{}) (*OpenAIStre
 		}
 
 	case *provider.ClaudeContentBlockDelta:
+		// Apply stream context for consistent id/model
+		chunk.ID = streamID
+		chunk.Model = streamModel
 		if e.Delta.Type == "text_delta" {
 			chunk.Choices = []Choice{
 				{
@@ -458,6 +511,9 @@ func (t *ClaudeTransformer) TransformStreamEvent(event interface{}) (*OpenAIStre
 		}
 
 	case *provider.ClaudeMessageDelta:
+		// Apply stream context for consistent id/model
+		chunk.ID = streamID
+		chunk.Model = streamModel
 		finishReason := t.mapStopReason(e.Delta.StopReason)
 		chunk.Choices = []Choice{
 			{
@@ -479,9 +535,9 @@ func (t *ClaudeTransformer) TransformStreamEvent(event interface{}) (*OpenAIStre
 	return chunk, nil
 }
 
-// Ensure ClaudeTransformer implements Transformer interface
-var _ Transformer = (*ClaudeTransformer)(nil)
-
-// Unused import guard
-var _ = base64.StdEncoding
+// Ensure ClaudeTransformer implements Transformer and StreamContextSetter interfaces
+var (
+	_ Transformer          = (*ClaudeTransformer)(nil)
+	_ StreamContextSetter  = (*ClaudeTransformer)(nil)
+)
 

@@ -47,3 +47,34 @@ func MatchAnyWildcardOrExact(patterns []string, str string) bool {
 	return false
 }
 
+// NormalizeBaseURL removes trailing slashes from a base URL to prevent
+// double slashes when joining with path segments
+func NormalizeBaseURL(baseURL string) string {
+	if baseURL == "" {
+		return baseURL
+	}
+	// Remove all trailing slashes
+	for len(baseURL) > 0 && baseURL[len(baseURL)-1] == '/' {
+		baseURL = baseURL[:len(baseURL)-1]
+	}
+	return baseURL
+}
+
+// JoinURL joins a base URL with path segments, handling trailing/leading slashes
+func JoinURL(baseURL string, paths ...string) string {
+	result := NormalizeBaseURL(baseURL)
+	for _, path := range paths {
+		// Remove leading slash from path
+		for len(path) > 0 && path[0] == '/' {
+			path = path[1:]
+		}
+		// Remove trailing slash from path (except last segment)
+		for len(path) > 0 && path[len(path)-1] == '/' {
+			path = path[:len(path)-1]
+		}
+		if path != "" {
+			result = result + "/" + path
+		}
+	}
+	return result
+}

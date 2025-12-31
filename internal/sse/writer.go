@@ -44,6 +44,7 @@ type Writer struct {
 	stopCh       chan struct{}
 	lastEventID  string
 	maxEventSize int // Maximum event size in bytes
+	ctx          context.Context // Request context for cleanup
 }
 
 // WriterOption configures a Writer
@@ -65,6 +66,13 @@ func WithMaxEventSize(size int) WriterOption {
 	}
 }
 
+// WithContext sets the request context for cleanup
+func WithContext(ctx context.Context) WriterOption {
+	return func(w *Writer) {
+		w.ctx = ctx
+	}
+}
+
 // NewWriter creates a new SSE writer
 func NewWriter(w http.ResponseWriter, opts ...WriterOption) (*Writer, error) {
 	flusher, ok := w.(http.Flusher)
@@ -83,6 +91,7 @@ func NewWriter(w http.ResponseWriter, opts ...WriterOption) (*Writer, error) {
 		flusher:      flusher,
 		stopCh:       make(chan struct{}),
 		maxEventSize: DefaultMaxEventSize,
+		ctx:          context.Background(), // Default to background context
 	}
 
 	for _, opt := range opts {
@@ -246,6 +255,7 @@ func (w *Writer) IsClosed() bool {
 }
 
 // keepaliveLoop sends periodic keepalive comments
+// Exits when Close() is called, context is cancelled, or write fails
 func (w *Writer) keepaliveLoop() {
 	ticker := time.NewTicker(w.keepalive)
 	defer ticker.Stop()
@@ -257,6 +267,9 @@ func (w *Writer) keepaliveLoop() {
 				return
 			}
 		case <-w.stopCh:
+			return
+		case <-w.ctx.Done():
+			// Context cancelled (client disconnected, request timeout, etc.)
 			return
 		}
 	}
@@ -310,10 +323,39 @@ func (r *Reader) Read(ctx context.Context) (<-chan Event, <-chan error) {
 	return r.eventCh, r.errCh
 }
 
-// readLoop reads SSE events until EOF or context cancellation
+// lineResult represents the result of reading a line
+type lineResult struct {
+	line string
+	err  error
+}
+
+// readLoop reads SSE events until EOF or context cancellation.
+// Uses a separate goroutine for reading to properly handle context cancellation
+// even when the underlying read is blocked.
 func (r *Reader) readLoop(ctx context.Context) {
 	defer close(r.eventCh)
 	defer close(r.errCh)
+
+	// Create a channel for line results
+	lineCh := make(chan lineResult, 1)
+
+	// Start a goroutine to read lines
+	// This goroutine will exit when the reader returns an error (including EOF)
+	// or when the connection is closed
+	go func() {
+		defer close(lineCh)
+		for {
+			line, err := r.reader.ReadString('\n')
+			select {
+			case lineCh <- lineResult{line: line, err: err}:
+				if err != nil {
+					return
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 
 	var event Event
 
@@ -322,79 +364,75 @@ func (r *Reader) readLoop(ctx context.Context) {
 		case <-ctx.Done():
 			r.errCh <- ctx.Err()
 			return
-		default:
-		}
-
-		line, err := r.reader.ReadString('\n')
-		if err != nil {
-			if err != io.EOF {
-				r.errCh <- err
-			}
-			return
-		}
-
-		line = strings.TrimRight(line, "\r\n")
-
-		// Empty line = dispatch event
-		if line == "" {
-			if event.Event != "" || event.Data != nil || len(event.RawData) > 0 {
-				event.ID = r.lastID
-				select {
-				case r.eventCh <- event:
-				case <-ctx.Done():
-					return
-				}
-				event = Event{}
-			}
-			continue
-		}
-
-		// Comment line
-		if strings.HasPrefix(line, ":") {
-			continue
-		}
-
-		// Parse field
-		colonIdx := strings.Index(line, ":")
-		var field, value string
-		if colonIdx == -1 {
-			field = line
-			value = ""
-		} else {
-			field = line[:colonIdx]
-			value = line[colonIdx+1:]
-			if len(value) > 0 && value[0] == ' ' {
-				value = value[1:]
-			}
-		}
-
-		switch field {
-		case "event":
-			event.Event = value
-		case "data":
-			// Check size limit before appending data
-			newSize := len(event.RawData) + len(value) + 1 // +1 for newline
-			if newSize > r.maxEventSize {
-				r.errCh <- ErrEventTooLarge
+		case result, ok := <-lineCh:
+			if !ok {
+				// Channel closed, reader goroutine has exited
 				return
 			}
-			if event.RawData == nil {
-				event.RawData = []byte(value)
-			} else {
-				event.RawData = append(event.RawData, '\n')
-				event.RawData = append(event.RawData, []byte(value)...)
+
+			if result.err != nil {
+				if result.err != io.EOF {
+					r.errCh <- result.err
+				}
+				return
 			}
-		case "id":
-			r.lastID = value
-		case "retry":
-			// Parse retry value (ignored for now)
+
+			line := strings.TrimRight(result.line, "\r\n")
+
+			// Empty line = dispatch event
+			if line == "" {
+				if event.Event != "" || event.Data != nil || len(event.RawData) > 0 {
+					event.ID = r.lastID
+					select {
+					case r.eventCh <- event:
+					case <-ctx.Done():
+						return
+					}
+					event = Event{}
+				}
+				continue
+			}
+
+			// Comment line
+			if strings.HasPrefix(line, ":") {
+				continue
+			}
+
+			// Parse field
+			colonIdx := strings.Index(line, ":")
+			var field, value string
+			if colonIdx == -1 {
+				field = line
+				value = ""
+			} else {
+				field = line[:colonIdx]
+				value = line[colonIdx+1:]
+				if len(value) > 0 && value[0] == ' ' {
+					value = value[1:]
+				}
+			}
+
+			switch field {
+			case "event":
+				event.Event = value
+			case "data":
+				// Check size limit before appending data
+				newSize := len(event.RawData) + len(value) + 1 // +1 for newline
+				if newSize > r.maxEventSize {
+					r.errCh <- ErrEventTooLarge
+					return
+				}
+				if event.RawData == nil {
+					event.RawData = []byte(value)
+				} else {
+					event.RawData = append(event.RawData, '\n')
+					event.RawData = append(event.RawData, []byte(value)...)
+				}
+			case "id":
+				r.lastID = value
+			case "retry":
+				// Parse retry value (ignored for now)
+			}
 		}
 	}
 }
-
-// Unused import guards
-var (
-	_ = bufio.NewReader
-	_ = context.Background
-)
-

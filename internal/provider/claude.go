@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -27,6 +28,10 @@ const (
 	ClaudeCallbackPort = 54545
 	ClaudeUserAgent    = "claude-code/1.0.0"
 	DefaultMaxTokens   = 4096
+
+	// MaxErrorResponseSize is the maximum size for error response bodies (64KB)
+	// This prevents memory exhaustion from malicious or buggy upstream servers
+	MaxErrorResponseSize = 64 * 1024
 )
 
 // ClaudeProvider implements the Provider interface for Claude/Anthropic
@@ -48,10 +53,21 @@ func NewClaudeProvider(config ProviderConfig, tokenStore auth.Store, tokenID str
 	// Configure proxy if specified
 	if config.ProxyURL != "" {
 		proxyURL, err := url.Parse(config.ProxyURL)
-		if err == nil {
+		if err != nil {
+			// Log proxy URL parse error - this is a configuration issue that should be visible
+			slog.Error("failed to parse proxy URL for Claude provider, proxy will not be used",
+				"proxy_url", config.ProxyURL,
+				"error", err)
+		} else {
 			client.Transport = &http.Transport{
-				Proxy: http.ProxyURL(proxyURL),
+				Proxy:                 http.ProxyURL(proxyURL),
+				MaxIdleConns:          100,
+				MaxIdleConnsPerHost:   10,
+				IdleConnTimeout:       90 * time.Second,
+				TLSHandshakeTimeout:   10 * time.Second,
+				ExpectContinueTimeout: 1 * time.Second,
 			}
+			slog.Debug("proxy configured for Claude provider", "proxy_url", config.ProxyURL)
 		}
 	}
 
@@ -187,7 +203,8 @@ func (p *ClaudeProvider) RefreshToken(ctx context.Context, refreshToken string) 
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		// Limit error response size to prevent memory exhaustion from malicious servers
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorResponseSize))
 		return nil, fmt.Errorf("refresh token failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -235,7 +252,7 @@ func (p *ClaudeProvider) SendRequest(ctx context.Context, req interface{}) (inte
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	baseURL := p.config.BaseURL
+	baseURL := util.NormalizeBaseURL(p.config.BaseURL)
 	if baseURL == "" {
 		baseURL = ClaudeAPIBaseURL
 	}
@@ -288,7 +305,7 @@ func (p *ClaudeProvider) StreamRequest(ctx context.Context, req interface{}) (<-
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	baseURL := p.config.BaseURL
+	baseURL := util.NormalizeBaseURL(p.config.BaseURL)
 	if baseURL == "" {
 		baseURL = ClaudeAPIBaseURL
 	}
@@ -332,7 +349,8 @@ func (p *ClaudeProvider) setClaudeHeaders(req *http.Request, token string) {
 
 // handleErrorResponse handles error responses from Claude API
 func (p *ClaudeProvider) handleErrorResponse(resp *http.Response) error {
-	body, _ := io.ReadAll(resp.Body)
+	// Limit error response size to prevent memory exhaustion from malicious servers
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorResponseSize))
 
 	var errResp struct {
 		Error struct {
@@ -362,12 +380,24 @@ func (p *ClaudeProvider) handleErrorResponse(resp *http.Response) error {
 	return fmt.Errorf("Claude API error (status %d): %s", resp.StatusCode, string(body))
 }
 
+// SSE Scanner buffer constants
+const (
+	// MaxSSEScanTokenSize is the maximum size for a single SSE line (1MB)
+	// This prevents "token too long" errors for large model outputs
+	MaxSSEScanTokenSize = 1024 * 1024
+)
+
 // processSSEStream processes Server-Sent Events from Claude
 func (p *ClaudeProvider) processSSEStream(ctx context.Context, body io.ReadCloser, eventCh chan<- StreamEvent) {
 	defer close(eventCh)
 	defer body.Close()
 
 	scanner := bufio.NewScanner(body)
+	// Set larger buffer to handle long SSE events (e.g., large code generation)
+	// Default bufio.Scanner limit is 64KB which may be insufficient
+	buf := make([]byte, MaxSSEScanTokenSize)
+	scanner.Buffer(buf, MaxSSEScanTokenSize)
+
 	var eventType string
 
 	for scanner.Scan() {

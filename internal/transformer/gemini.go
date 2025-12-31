@@ -409,8 +409,5 @@ var _ Transformer = (*GeminiTransformer)(nil)
 // Ensure GeminiTransformer implements StreamContextSetter interface
 var _ StreamContextSetter = (*GeminiTransformer)(nil)
 
-// Unused import guards
-var (
-	_ = base64.StdEncoding
-	_ = strings.HasPrefix
-)
+// Unused import guard - base64 may be needed for future image encoding
+var _ = base64.StdEncoding

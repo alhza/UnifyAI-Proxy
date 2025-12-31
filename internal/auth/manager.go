@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"sync"
 	"time"
 )
@@ -31,6 +32,7 @@ type TokenManager struct {
 	mu              sync.RWMutex
 	stopCh          chan struct{}
 	wg              sync.WaitGroup
+	stopOnce        sync.Once // Prevents double-close panic
 }
 
 // ManagedAccount represents an account managed by TokenManager
@@ -192,8 +194,11 @@ func (tm *TokenManager) StartAutoRefresh(ctx context.Context, refreshFn RefreshF
 }
 
 // Stop stops the token manager and waits for background goroutines
+// Safe to call multiple times (uses sync.Once internally)
 func (tm *TokenManager) Stop() {
-	close(tm.stopCh)
+	tm.stopOnce.Do(func() {
+		close(tm.stopCh)
+	})
 	tm.wg.Wait()
 }
 
@@ -455,4 +460,7 @@ func (tm *TokenManager) RefreshToken(ctx context.Context, provider, id string, h
 	return tm.store.Save(provider, id, newToken)
 }
 
-
+// HTTPDoer is an interface for HTTP client that can perform requests
+type HTTPDoer interface {
+	Do(req *http.Request) (*http.Response, error)
+}

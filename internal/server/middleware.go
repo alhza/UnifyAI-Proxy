@@ -2,11 +2,15 @@ package server
 
 import (
 	"context"
-	"crypto/subtle"
+	"crypto/hmac"
+	"crypto/sha256"
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
+
+	"golang.org/x/time/rate"
 )
 
 // RequestIDKey is the context key for request ID
@@ -109,12 +113,15 @@ func CORSMiddleware(allowedOrigins []string) Middleware {
 	}
 }
 
-// AuthMiddleware validates API key authentication using constant-time comparison
+// AuthMiddleware validates API key authentication using HMAC-SHA256 hashing
+// to prevent timing attacks (no length-based short-circuit)
 func AuthMiddleware(apiKeys []string) Middleware {
-	// Store keys as byte slices for constant-time comparison
-	keyBytes := make([][]byte, len(apiKeys))
+	// Pre-compute HMAC-SHA256 hashes of all valid keys using a fixed secret
+	// This prevents timing attacks based on key length differences
+	hashSecret := []byte("unifyai-proxy-auth-v1")
+	keyHashes := make([][]byte, len(apiKeys))
 	for i, k := range apiKeys {
-		keyBytes[i] = []byte(k)
+		keyHashes[i] = computeKeyHash(hashSecret, k)
 	}
 
 	return func(next http.Handler) http.Handler {
@@ -140,14 +147,15 @@ func AuthMiddleware(apiKeys []string) Middleware {
 				return
 			}
 
-			// Use constant-time comparison to prevent timing attacks
-			apiKeyBytes := []byte(apiKey)
+			// Compute hash of provided key and compare against all valid hashes
+			// This is constant-time regardless of key lengths
+			providedHash := computeKeyHash(hashSecret, apiKey)
 			valid := false
-			for _, kb := range keyBytes {
-				// Only compare if lengths match (constant time for equal-length keys)
-				if len(kb) == len(apiKeyBytes) && subtle.ConstantTimeCompare(kb, apiKeyBytes) == 1 {
+			for _, kh := range keyHashes {
+				// hmac.Equal is constant-time for equal-length inputs (which hashes always are)
+				if hmac.Equal(providedHash, kh) {
 					valid = true
-					break
+					// Don't break early to maintain constant time across all keys
 				}
 			}
 
@@ -161,14 +169,205 @@ func AuthMiddleware(apiKeys []string) Middleware {
 	}
 }
 
-// RateLimitMiddleware implements simple rate limiting (placeholder)
-func RateLimitMiddleware(requestsPerMinute int) Middleware {
-	// TODO: Implement proper rate limiting with token bucket or sliding window
-	return func(next http.Handler) http.Handler {
+// computeKeyHash computes HMAC-SHA256 of a key using the provided secret
+func computeKeyHash(secret []byte, key string) []byte {
+	h := hmac.New(sha256.New, secret)
+	h.Write([]byte(key))
+	return h.Sum(nil)
+}
+
+// RateLimiter provides rate limiting middleware with cleanup capability
+type RateLimiter struct {
+	store      *rateLimiterStore
+	middleware Middleware
+}
+
+// Middleware returns the rate limiting middleware handler
+func (rl *RateLimiter) Middleware() Middleware {
+	return rl.middleware
+}
+
+// Stop stops the background cleanup goroutine
+func (rl *RateLimiter) Stop() {
+	rl.store.stop()
+}
+
+// NewRateLimiter creates a new rate limiter with cleanup capability.
+// Call Stop() when shutting down to prevent goroutine leak.
+func NewRateLimiter(requestsPerSecond float64, burstSize int) *RateLimiter {
+	if requestsPerSecond <= 0 {
+		requestsPerSecond = 10 // Default: 10 requests per second
+	}
+	if burstSize <= 0 {
+		burstSize = 20 // Default: burst of 20
+	}
+
+	// Use a map to track rate limiters per client
+	store := &rateLimiterStore{
+		limiters: make(map[string]*rate.Limiter),
+		rate:     rate.Limit(requestsPerSecond),
+		burst:    burstSize,
+		stopCh:   make(chan struct{}),
+	}
+
+	// Cleanup old limiters periodically (prevent memory leak)
+	go store.cleanupLoop()
+
+	middleware := func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Skip rate limiting for health/ready endpoints
+			if r.URL.Path == "/health" || r.URL.Path == "/ready" {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			// Get client identifier (prefer API key, fallback to IP)
+			clientID := getClientIdentifier(r)
+			limiter := store.get(clientID)
+
+			if !limiter.Allow() {
+				w.Header().Set("Retry-After", "1")
+				WriteError(w, http.StatusTooManyRequests, "rate_limited", "Rate limit exceeded. Please slow down your requests.")
+				return
+			}
+
 			next.ServeHTTP(w, r)
 		})
 	}
+
+	return &RateLimiter{
+		store:      store,
+		middleware: middleware,
+	}
+}
+
+// RateLimitMiddleware implements token bucket rate limiting per client (by API key or IP)
+// Deprecated: Use NewRateLimiter instead for proper cleanup support.
+// This function is kept for backward compatibility but the cleanup goroutine
+// will run for the lifetime of the process.
+func RateLimitMiddleware(requestsPerSecond float64, burstSize int) Middleware {
+	rl := NewRateLimiter(requestsPerSecond, burstSize)
+	return rl.Middleware()
+}
+
+// rateLimiterStore manages per-client rate limiters with thread-safe access
+type rateLimiterStore struct {
+	limiters map[string]*rate.Limiter
+	rate     rate.Limit
+	burst    int
+	mu       sync.RWMutex
+	lastSeen map[string]time.Time
+	stopCh   chan struct{}  // Channel to signal cleanup goroutine to stop
+	stopped  bool           // Flag to prevent double-stop
+}
+
+// get returns or creates a rate limiter for the given client ID
+func (s *rateLimiterStore) get(clientID string) *rate.Limiter {
+	s.mu.RLock()
+	limiter, exists := s.limiters[clientID]
+	s.mu.RUnlock()
+
+	if exists {
+		s.updateLastSeen(clientID)
+		return limiter
+	}
+
+	// Create new limiter
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Double-check after acquiring write lock
+	if limiter, exists = s.limiters[clientID]; exists {
+		return limiter
+	}
+
+	limiter = rate.NewLimiter(s.rate, s.burst)
+	s.limiters[clientID] = limiter
+	if s.lastSeen == nil {
+		s.lastSeen = make(map[string]time.Time)
+	}
+	s.lastSeen[clientID] = time.Now()
+	return limiter
+}
+
+// updateLastSeen updates the last seen time for a client
+func (s *rateLimiterStore) updateLastSeen(clientID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.lastSeen == nil {
+		s.lastSeen = make(map[string]time.Time)
+	}
+	s.lastSeen[clientID] = time.Now()
+}
+
+// cleanupLoop removes stale rate limiters to prevent memory leaks
+// It listens for the stop signal to gracefully exit
+func (s *rateLimiterStore) cleanupLoop() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			s.cleanup()
+		case <-s.stopCh:
+			return
+		}
+	}
+}
+
+// stop signals the cleanup goroutine to stop
+func (s *rateLimiterStore) stop() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.stopped && s.stopCh != nil {
+		close(s.stopCh)
+		s.stopped = true
+	}
+}
+
+// cleanup removes limiters not seen in the last 10 minutes
+func (s *rateLimiterStore) cleanup() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	threshold := time.Now().Add(-10 * time.Minute)
+	for clientID, lastSeen := range s.lastSeen {
+		if lastSeen.Before(threshold) {
+			delete(s.limiters, clientID)
+			delete(s.lastSeen, clientID)
+		}
+	}
+}
+
+// getClientIdentifier extracts client identifier from request (API key or IP)
+func getClientIdentifier(r *http.Request) string {
+	// Try to get API key first
+	authHeader := r.Header.Get("Authorization")
+	if strings.HasPrefix(authHeader, "Bearer ") {
+		return "key:" + strings.TrimPrefix(authHeader, "Bearer ")
+	}
+	if apiKey := r.Header.Get("X-API-Key"); apiKey != "" {
+		return "key:" + apiKey
+	}
+
+	// Fall back to IP address
+	// Check X-Forwarded-For for proxied requests
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		// Take the first IP in the chain
+		if idx := strings.Index(xff, ","); idx != -1 {
+			return "ip:" + strings.TrimSpace(xff[:idx])
+		}
+		return "ip:" + strings.TrimSpace(xff)
+	}
+
+	// Check X-Real-IP
+	if xri := r.Header.Get("X-Real-IP"); xri != "" {
+		return "ip:" + xri
+	}
+
+	// Fall back to RemoteAddr
+	return "ip:" + r.RemoteAddr
 }
 
 // TimeoutMiddleware adds request timeout

@@ -164,8 +164,19 @@ func (cw *ConfigWatcher) reload() {
 	cw.mu.RUnlock()
 
 	for _, listener := range listeners {
-		go listener.OnConfigChange(newConfig)
+		go cw.notifyListener(listener, newConfig)
 	}
+}
+
+// notifyListener safely notifies a single listener with panic recovery
+func (cw *ConfigWatcher) notifyListener(listener ConfigChangeListener, newConfig *Config) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("panic in config change listener: %v", r)
+		}
+	}()
+
+	listener.OnConfigChange(newConfig)
 }
 
 // ResolveModel resolves a model name through the alias chain

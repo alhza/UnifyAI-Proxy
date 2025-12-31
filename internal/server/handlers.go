@@ -2,8 +2,11 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
+	"log/slog"
 	"net/http"
+	"sort"
 	"sync"
 	"time"
 
@@ -22,6 +25,7 @@ const DefaultMaxEventSize = 1024 * 1024
 // Handlers contains HTTP handlers for the API
 type Handlers struct {
 	providers       map[string]provider.Provider
+	providerNames   []string // Ordered list of provider names for deterministic selection
 	transformers    map[string]transformer.Transformer
 	accountSelector account.AccountSelector
 	maxRequestSize  int64
@@ -40,6 +44,7 @@ type HandlersConfig struct {
 func NewHandlers() *Handlers {
 	return &Handlers{
 		providers:      make(map[string]provider.Provider),
+		providerNames:  make([]string, 0),
 		transformers:   make(map[string]transformer.Transformer),
 		maxRequestSize: DefaultMaxRequestSize,
 		maxEventSize:   DefaultMaxEventSize,
@@ -58,6 +63,7 @@ func NewHandlersWithConfig(cfg HandlersConfig) *Handlers {
 	}
 	return &Handlers{
 		providers:       make(map[string]provider.Provider),
+		providerNames:   make([]string, 0),
 		transformers:    make(map[string]transformer.Transformer),
 		accountSelector: cfg.AccountSelector,
 		maxRequestSize:  maxSize,
@@ -73,9 +79,17 @@ func (h *Handlers) SetAccountSelector(selector account.AccountSelector) {
 }
 
 // RegisterProvider registers a provider (thread-safe)
+// Providers are selected in alphabetical order by name for deterministic behavior
 func (h *Handlers) RegisterProvider(name string, p provider.Provider) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+
+	// Only add to names list if this is a new provider
+	if _, exists := h.providers[name]; !exists {
+		h.providerNames = append(h.providerNames, name)
+		// Keep names sorted for deterministic selection order
+		sort.Strings(h.providerNames)
+	}
 	h.providers[name] = p
 }
 
@@ -110,7 +124,12 @@ func (h *Handlers) ModelsHandler(w http.ResponseWriter, r *http.Request) {
 	var models []ModelData
 
 	h.mu.RLock()
-	for name, p := range h.providers {
+	// Iterate in sorted order for deterministic response
+	for _, name := range h.providerNames {
+		p := h.providers[name]
+		if p == nil {
+			continue
+		}
 		for _, modelName := range p.SupportedModels() {
 			models = append(models, ModelData{
 				ID:      modelName,
@@ -132,6 +151,8 @@ func (h *Handlers) ModelsHandler(w http.ResponseWriter, r *http.Request) {
 
 // ChatCompletionsHandler handles /v1/chat/completions endpoint
 func (h *Handlers) ChatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
+	startTime := time.Now()
+
 	// Limit request body size to prevent memory exhaustion attacks
 	r.Body = http.MaxBytesReader(w, r.Body, h.maxRequestSize)
 	defer r.Body.Close()
@@ -139,8 +160,9 @@ func (h *Handlers) ChatCompletionsHandler(w http.ResponseWriter, r *http.Request
 	// Parse request
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		// Check if error is due to request body being too large
-		if err.Error() == "http: request body too large" {
+		// Check if error is due to request body being too large using proper type check
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
 			WriteError(w, http.StatusRequestEntityTooLarge, "request_too_large", "Request body exceeds maximum allowed size")
 			return
 		}
@@ -160,15 +182,19 @@ func (h *Handlers) ChatCompletionsHandler(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Find provider for model (thread-safe)
+	// Find provider for model (thread-safe, deterministic order)
 	var selectedProvider provider.Provider
 	var selectedTransformer transformer.Transformer
+	var providerName string
 
 	h.mu.RLock()
-	for name, p := range h.providers {
-		if p.SupportsModel(req.Model) {
+	// Iterate in sorted order for deterministic provider selection
+	for _, name := range h.providerNames {
+		p := h.providers[name]
+		if p != nil && p.SupportsModel(req.Model) {
 			selectedProvider = p
 			selectedTransformer = h.transformers[name]
+			providerName = name
 			break
 		}
 	}
@@ -182,6 +208,22 @@ func (h *Handlers) ChatCompletionsHandler(w http.ResponseWriter, r *http.Request
 	if selectedTransformer == nil {
 		WriteError(w, http.StatusInternalServerError, "configuration_error", "No transformer configured for provider")
 		return
+	}
+
+	// Pick an account if account selector is configured
+	var selectedAccount *account.Account
+	if h.accountSelector != nil {
+		acc, err := h.accountSelector.Pick(req.Model, providerName)
+		if err != nil {
+			slog.Warn("Failed to pick account, using provider default",
+				"provider", providerName,
+				"model", req.Model,
+				"error", err)
+			// Fall through to use provider default (no account selection)
+		} else {
+			selectedAccount = acc
+			defer acc.Release()
+		}
 	}
 
 	// Transform request
@@ -203,6 +245,7 @@ func (h *Handlers) ChatCompletionsHandler(w http.ResponseWriter, r *http.Request
 
 		eventCh, err := selectedProvider.StreamRequest(ctx, providerReq)
 		if err != nil {
+			h.markAccountResult(selectedAccount, false, err, time.Since(startTime), 0)
 			WriteError(w, http.StatusInternalServerError, "provider_error", err.Error())
 			return
 		}
@@ -210,26 +253,107 @@ func (h *Handlers) ChatCompletionsHandler(w http.ResponseWriter, r *http.Request
 		config := sse.DefaultStreamConfig()
 		config.MaxEventSize = h.maxEventSize
 		if err := sse.ProxyStream(ctx, w, eventCh, selectedTransformer, config); err != nil {
+			h.markAccountResult(selectedAccount, false, err, time.Since(startTime), 0)
 			// Error already written to stream
 			return
 		}
+
+		// Mark success for streaming (token count not available for streams)
+		h.markAccountResult(selectedAccount, true, nil, time.Since(startTime), 0)
 		return
 	}
 
 	// Handle non-streaming
 	providerResp, err := selectedProvider.SendRequest(ctx, providerReq)
 	if err != nil {
+		h.markAccountResult(selectedAccount, false, err, time.Since(startTime), 0)
 		WriteError(w, http.StatusInternalServerError, "provider_error", err.Error())
 		return
 	}
 
 	openAIResp, err := selectedTransformer.TransformResponse(providerResp)
 	if err != nil {
+		h.markAccountResult(selectedAccount, false, err, time.Since(startTime), 0)
 		WriteError(w, http.StatusInternalServerError, "transform_error", err.Error())
 		return
 	}
 
+	// Extract token usage if available
+	var tokensUsed int64
+	if openAIResp != nil && openAIResp.Usage != nil {
+		tokensUsed = int64(openAIResp.Usage.TotalTokens)
+	}
+
+	h.markAccountResult(selectedAccount, true, nil, time.Since(startTime), tokensUsed)
 	WriteJSON(w, http.StatusOK, openAIResp)
+}
+
+// markAccountResult updates account state based on request result
+func (h *Handlers) markAccountResult(acc *account.Account, success bool, err error, responseTime time.Duration, tokensUsed int64) {
+	if acc == nil || h.accountSelector == nil {
+		return
+	}
+
+	result := account.Result{
+		Success:      success,
+		TokensUsed:   tokensUsed,
+		ResponseTime: responseTime,
+		Error:        err,
+	}
+
+	if !success && err != nil {
+		result.ErrorType, result.ErrorCode = classifyError(err)
+		result.ShouldSwitch = result.ErrorType == account.ErrorTypeQuotaExceeded ||
+			result.ErrorType == account.ErrorTypeRateLimited ||
+			result.ErrorType == account.ErrorTypeAuthError
+		result.ShouldRetry = result.ErrorType == account.ErrorTypeNetworkError ||
+			result.ErrorType == account.ErrorTypeServerError
+	}
+
+	h.accountSelector.MarkResult(acc, result)
+}
+
+// classifyError classifies an error into an ErrorType and HTTP status code
+func classifyError(err error) (account.ErrorType, int) {
+	if err == nil {
+		return account.ErrorTypeNone, 0
+	}
+
+	// Check for known provider errors
+	if errors.Is(err, provider.ErrQuotaExceeded) {
+		return account.ErrorTypeQuotaExceeded, 429
+	}
+	if errors.Is(err, provider.ErrRateLimited) {
+		return account.ErrorTypeRateLimited, 429
+	}
+	if errors.Is(err, provider.ErrAuthenticationFailed) || errors.Is(err, provider.ErrTokenExpired) {
+		return account.ErrorTypeAuthError, 401
+	}
+	if errors.Is(err, provider.ErrServerError) {
+		return account.ErrorTypeServerError, 500
+	}
+	if errors.Is(err, provider.ErrNetworkError) {
+		return account.ErrorTypeNetworkError, 0
+	}
+
+	// Check for provider error type
+	var providerErr *provider.ProviderError
+	if errors.As(err, &providerErr) {
+		switch providerErr.StatusCode {
+		case 401, 403:
+			return account.ErrorTypeAuthError, providerErr.StatusCode
+		case 429:
+			// Distinguish between rate limit and quota exceeded based on error message
+			if providerErr.Type == "quota_exceeded" {
+				return account.ErrorTypeQuotaExceeded, 429
+			}
+			return account.ErrorTypeRateLimited, 429
+		case 500, 502, 503, 504:
+			return account.ErrorTypeServerError, providerErr.StatusCode
+		}
+	}
+
+	return account.ErrorTypeNetworkError, 0
 }
 
 // RegisterRoutes registers all routes

@@ -86,6 +86,7 @@ type SlidingWindowRateLimiter struct {
 	window        time.Duration // window duration
 	cleanupTicker *time.Ticker
 	stopCleanup   chan struct{}
+	stopOnce      sync.Once // Prevents double-close panic on stopCleanup channel
 }
 
 type slidingWindow struct {
@@ -148,12 +149,15 @@ func (r *SlidingWindowRateLimiter) cleanup() {
 	}
 }
 
-// Stop stops the cleanup goroutine and releases resources
+// Stop stops the cleanup goroutine and releases resources.
+// Safe to call multiple times - uses sync.Once internally to prevent double-close panic.
 func (r *SlidingWindowRateLimiter) Stop() {
-	if r.cleanupTicker != nil {
-		r.cleanupTicker.Stop()
-	}
-	close(r.stopCleanup)
+	r.stopOnce.Do(func() {
+		if r.cleanupTicker != nil {
+			r.cleanupTicker.Stop()
+		}
+		close(r.stopCleanup)
+	})
 }
 
 // CurrentCount returns the current request count (implements RateLimiterWithCount)

@@ -50,7 +50,9 @@ func (h *StreamHandler) HandleStream(
 	eventCh <-chan provider.StreamEvent,
 ) error {
 	// Create SSE writer with configuration
-	opts := []WriterOption{}
+	opts := []WriterOption{
+		WithContext(ctx), // Pass request context for proper cleanup on client disconnect
+	}
 	if h.keepalive > 0 {
 		opts = append(opts, WithKeepalive(h.keepalive))
 	}

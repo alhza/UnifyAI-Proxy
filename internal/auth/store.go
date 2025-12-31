@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sync"
 	"time"
 )
@@ -15,7 +16,11 @@ var (
 	ErrTokenNotFound       = errors.New("token not found")
 	ErrInvalidToken        = errors.New("invalid token")
 	ErrEncryptionRequired  = errors.New("encryption key required for production mode")
+	ErrInvalidIdentifier   = errors.New("invalid provider or token identifier")
 )
+
+// safeIdentifierPattern matches only safe identifiers (alphanumeric, underscore, hyphen, dot)
+var safeIdentifierPattern = regexp.MustCompile(`^[a-zA-Z0-9_\-\.]+$`)
 
 // Token represents an OAuth token
 type Token struct {
@@ -209,6 +214,17 @@ func NewFileStoreWithEncryption(baseDir string, encryptionKey []byte) (*FileStor
 }
 
 
+// validateIdentifier checks if provider and id are safe (no path traversal)
+func validateIdentifier(provider, id string) error {
+	if !safeIdentifierPattern.MatchString(provider) {
+		return ErrInvalidIdentifier
+	}
+	if !safeIdentifierPattern.MatchString(id) {
+		return ErrInvalidIdentifier
+	}
+	return nil
+}
+
 // tokenPath returns the file path for a token
 func (s *FileStore) tokenPath(provider, id string) string {
 	ext := ".json"
@@ -220,6 +236,11 @@ func (s *FileStore) tokenPath(provider, id string) string {
 
 // Save saves a token to file (encrypted if encryptor is configured)
 func (s *FileStore) Save(provider, id string, tok *Token) error {
+	// Validate identifiers to prevent path traversal
+	if err := validateIdentifier(provider, id); err != nil {
+		return err
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -250,6 +271,11 @@ func (s *FileStore) Save(provider, id string, tok *Token) error {
 
 // Load loads a token from file (decrypts if encryptor is configured)
 func (s *FileStore) Load(provider, id string) (*Token, error) {
+	// Validate identifiers to prevent path traversal
+	if err := validateIdentifier(provider, id); err != nil {
+		return nil, err
+	}
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -302,6 +328,11 @@ func (s *FileStore) Load(provider, id string) (*Token, error) {
 
 // Delete deletes a token file
 func (s *FileStore) Delete(provider, id string) error {
+	// Validate identifiers to prevent path traversal
+	if err := validateIdentifier(provider, id); err != nil {
+		return err
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -314,6 +345,11 @@ func (s *FileStore) Delete(provider, id string) error {
 
 // List lists all token IDs for a provider
 func (s *FileStore) List(provider string) ([]string, error) {
+	// Validate provider to prevent path traversal
+	if !safeIdentifierPattern.MatchString(provider) {
+		return nil, ErrInvalidIdentifier
+	}
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 

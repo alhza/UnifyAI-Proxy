@@ -23,7 +23,9 @@ type Config struct {
 	ProxyURL         string                 `yaml:"proxy-url"`
 	RequestRetry     int                    `yaml:"request-retry"`
 	MaxRetryInterval int                    `yaml:"max-retry-interval"`
-	MaxRequestSize   int64                  `yaml:"max-request-size"` // Max request body size in bytes (default: 10MB)
+	MaxRequestSize   int64                  `yaml:"max-request-size"`  // Max request body size in bytes (default: 10MB)
+	MaxEventSize     int                    `yaml:"max-event-size"`    // Max SSE event size in bytes (default: 1MB)
+	RateLimit        GlobalRateLimitConfig  `yaml:"rate-limit"`        // Global rate limit configuration
 	QuotaExceeded    QuotaExceededConfig    `yaml:"quota-exceeded"`
 	Routing          RoutingConfig          `yaml:"routing"`
 	Streaming        StreamingConfig        `yaml:"streaming"`
@@ -139,6 +141,13 @@ type RateLimits struct {
 	RPM int `yaml:"rpm"` // Requests per minute
 }
 
+// GlobalRateLimitConfig defines global rate limiting configuration
+type GlobalRateLimitConfig struct {
+	Enabled           bool    `yaml:"enabled"`             // Enable rate limiting
+	RequestsPerSecond float64 `yaml:"requests-per-second"` // Requests per second per client
+	BurstSize         int     `yaml:"burst-size"`          // Maximum burst size
+}
+
 // AccountLimitOverride allows per-account limit overrides
 type AccountLimitOverride struct {
 	ID    string      `yaml:"id"`
@@ -220,6 +229,12 @@ func DefaultConfig() *Config {
 		},
 		AuthDir:          "~/.unifyai-proxy/auths",
 		MaxRequestSize:   10 * 1024 * 1024, // 10MB default
+		MaxEventSize:     1024 * 1024,      // 1MB default for SSE events
+		RateLimit: GlobalRateLimitConfig{
+			Enabled:           false,            // Disabled by default
+			RequestsPerSecond: 10,               // 10 requests per second
+			BurstSize:         20,               // Burst of 20
+		},
 		Logging: LoggingConfig{
 			Level:     "info",
 			Directory: "./logs",

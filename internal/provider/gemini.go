@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -26,6 +27,10 @@ const (
 	GeminiCallbackPort = 54546
 	GeminiUserAgent    = "gemini-cli/1.0.0"
 	GeminiAPIVersion   = "v1beta"
+
+	// GeminiMaxErrorResponseSize is the maximum size for error response bodies (64KB)
+	// This prevents memory exhaustion from malicious or buggy upstream servers
+	GeminiMaxErrorResponseSize = 64 * 1024
 )
 
 // GeminiProvider implements the Provider interface for Google Gemini
@@ -44,12 +49,24 @@ func NewGeminiProvider(config ProviderConfig, tokenStore auth.Store, tokenID str
 		Timeout: time.Duration(config.Timeout) * time.Second,
 	}
 
+	// Configure proxy if specified
 	if config.ProxyURL != "" {
 		proxyURL, err := url.Parse(config.ProxyURL)
-		if err == nil {
+		if err != nil {
+			// Log proxy URL parse error - this is a configuration issue that should be visible
+			slog.Error("failed to parse proxy URL for Gemini provider, proxy will not be used",
+				"proxy_url", config.ProxyURL,
+				"error", err)
+		} else {
 			client.Transport = &http.Transport{
-				Proxy: http.ProxyURL(proxyURL),
+				Proxy:                 http.ProxyURL(proxyURL),
+				MaxIdleConns:          100,
+				MaxIdleConnsPerHost:   10,
+				IdleConnTimeout:       90 * time.Second,
+				TLSHandshakeTimeout:   10 * time.Second,
+				ExpectContinueTimeout: 1 * time.Second,
 			}
+			slog.Debug("proxy configured for Gemini provider", "proxy_url", config.ProxyURL)
 		}
 	}
 
@@ -181,7 +198,8 @@ func (p *GeminiProvider) RefreshToken(ctx context.Context, refreshToken string) 
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		// Limit error response size to prevent memory exhaustion from malicious servers
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, GeminiMaxErrorResponseSize))
 		return nil, fmt.Errorf("refresh token failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -227,7 +245,7 @@ func (p *GeminiProvider) SendRequest(ctx context.Context, req interface{}) (inte
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	baseURL := p.config.BaseURL
+	baseURL := util.NormalizeBaseURL(p.config.BaseURL)
 	if baseURL == "" {
 		baseURL = GeminiAPIBaseURL
 	}
@@ -275,7 +293,7 @@ func (p *GeminiProvider) StreamRequest(ctx context.Context, req interface{}) (<-
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	baseURL := p.config.BaseURL
+	baseURL := util.NormalizeBaseURL(p.config.BaseURL)
 	if baseURL == "" {
 		baseURL = GeminiAPIBaseURL
 	}
@@ -317,7 +335,8 @@ func (p *GeminiProvider) setGeminiHeaders(req *http.Request, token string) {
 
 // handleErrorResponse handles error responses from Gemini API
 func (p *GeminiProvider) handleErrorResponse(resp *http.Response) error {
-	body, _ := io.ReadAll(resp.Body)
+	// Limit error response size to prevent memory exhaustion from malicious servers
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, GeminiMaxErrorResponseSize))
 
 	var errResp struct {
 		Error struct {
@@ -348,12 +367,23 @@ func (p *GeminiProvider) handleErrorResponse(resp *http.Response) error {
 	return fmt.Errorf("Gemini API error (status %d): %s", resp.StatusCode, string(body))
 }
 
+// SSE Scanner buffer constants for Gemini
+const (
+	// GeminiMaxSSEScanTokenSize is the maximum size for a single SSE line (1MB)
+	// This prevents "token too long" errors for large model outputs
+	GeminiMaxSSEScanTokenSize = 1024 * 1024
+)
+
 // processSSEStream processes Server-Sent Events from Gemini
 func (p *GeminiProvider) processSSEStream(ctx context.Context, body io.ReadCloser, eventCh chan<- StreamEvent) {
 	defer close(eventCh)
 	defer body.Close()
 
 	scanner := bufio.NewScanner(body)
+	// Set larger buffer to handle long SSE events (e.g., large code generation)
+	// Default bufio.Scanner limit is 64KB which may be insufficient
+	buf := make([]byte, GeminiMaxSSEScanTokenSize)
+	scanner.Buffer(buf, GeminiMaxSSEScanTokenSize)
 
 	for scanner.Scan() {
 		select {
@@ -532,10 +562,3 @@ var (
 	_ Provider      = (*GeminiProvider)(nil)
 	_ OAuthProvider = (*GeminiProvider)(nil)
 )
-
-// Unused import guards
-var (
-	_ = bufio.NewReader
-	_ = bytes.NewReader
-)
-
