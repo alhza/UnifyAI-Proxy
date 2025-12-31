@@ -19,13 +19,14 @@ import (
 
 // Claude API constants
 const (
-	ClaudeAPIBaseURL     = "https://api.anthropic.com"
-	ClaudeOAuthBaseURL   = "https://claude.ai"
-	ClaudeAPIVersion     = "2023-06-01"
-	ClaudeClientID       = "claude-code-cli"
-	ClaudeCallbackPort   = 54545
-	ClaudeUserAgent      = "claude-code/1.0.0"
-	DefaultMaxTokens     = 4096
+	ClaudeAPIBaseURL   = "https://api.anthropic.com"
+	ClaudeOAuthBaseURL = "https://claude.ai"
+	ClaudeAPIVersion   = "2023-06-01"
+	// ClaudeClientID references auth.ClaudeOAuthClientID for consistency
+	ClaudeClientID     = auth.ClaudeOAuthClientID
+	ClaudeCallbackPort = 54545
+	ClaudeUserAgent    = "claude-code/1.0.0"
+	DefaultMaxTokens   = 4096
 )
 
 // ClaudeProvider implements the Provider interface for Claude/Anthropic

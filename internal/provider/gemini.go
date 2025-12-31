@@ -21,7 +21,8 @@ import (
 const (
 	GeminiAPIBaseURL   = "https://generativelanguage.googleapis.com"
 	GeminiOAuthBaseURL = "https://accounts.google.com"
-	GeminiClientID     = "667607542161-gua21ma1uangl0mphq8rm62rpi1klh6h.apps.googleusercontent.com"
+	// GeminiClientID references auth.GeminiOAuthClientID for consistency
+	GeminiClientID     = auth.GeminiOAuthClientID
 	GeminiCallbackPort = 54546
 	GeminiUserAgent    = "gemini-cli/1.0.0"
 	GeminiAPIVersion   = "v1beta"

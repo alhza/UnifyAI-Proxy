@@ -8,6 +8,20 @@ import (
 	"time"
 )
 
+// OAuth client IDs for token refresh
+// These MUST match the provider configurations to ensure refresh works correctly
+const (
+	// ClaudeOAuthClientID is the OAuth client ID for Claude (claude-code-cli)
+	ClaudeOAuthClientID = "claude-code-cli"
+	// ClaudeOAuthTokenURL is the token endpoint for Claude
+	ClaudeOAuthTokenURL = "https://claude.ai/oauth/token"
+
+	// GeminiOAuthClientID is the OAuth client ID for Gemini
+	GeminiOAuthClientID = "667607542161-gua21ma1uangl0mphq8rm62rpi1klh6h.apps.googleusercontent.com"
+	// GeminiOAuthTokenURL is the token endpoint for Gemini
+	GeminiOAuthTokenURL = "https://oauth2.googleapis.com/token"
+)
+
 // TokenManager manages tokens for multiple accounts and providers
 type TokenManager struct {
 	store           Store
@@ -415,11 +429,11 @@ func (tm *TokenManager) RefreshToken(ctx context.Context, provider, id string, h
 
 	switch provider {
 	case "claude":
-		tokenURL = "https://claude.ai/oauth/token"
-		clientID = "9b1ce91a-5ac7-4d05-b62a-5f04f71c7b98"
+		tokenURL = ClaudeOAuthTokenURL
+		clientID = ClaudeOAuthClientID
 	case "gemini":
-		tokenURL = "https://oauth2.googleapis.com/token"
-		clientID = "102778677549-s7ep01nh6l3nld4ik8p8c5uvnpj8rjdm.apps.googleusercontent.com"
+		tokenURL = GeminiOAuthTokenURL
+		clientID = GeminiOAuthClientID
 	default:
 		return fmt.Errorf("unsupported provider: %s", provider)
 	}
