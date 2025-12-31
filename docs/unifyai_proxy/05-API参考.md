@@ -16,6 +16,25 @@
 | `/health` | GET | 健康检查 |
 | `/metrics` | GET | 性能指标 |
 
+### 管理端点说明
+
+- `/management.html`：需要在配置中设置 `server.secret-key`，通过 Basic Auth 或查询参数（视实现）校验；仅建议在内网或隧道中访问。
+- `/health`：返回存活/就绪状态，可用于反向代理或编排器的健康检查。
+- `/metrics`：暴露运行指标（如请求总数、错误数、当前活动流、provider 选择命中等），建议仅在受控网络暴露。
+
+### 健康检查示例
+
+```bash
+curl -s http://127.0.0.1:8317/health
+```
+
+### 管理界面访问示例
+
+```bash
+# 若采用 Basic Auth（示例）
+curl -u admin:${SECRET_KEY} http://127.0.0.1:8317/management.html
+```
+
 ---
 
 ## 请求示例

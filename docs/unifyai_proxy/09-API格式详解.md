@@ -761,6 +761,14 @@ func convertToGeminiParts(content interface{}) []GeminiPart {
 | 500 | `server_error` | `api_error` | `INTERNAL` |
 | 529 | `overloaded_error` | `overloaded_error` | `UNAVAILABLE` |
 
+#### 统一错误处理建议
+
+- 401/403：返回 `error.code=invalid_authentication`，提示重新登录或刷新 token，避免泄露 provider 具体错误描述。
+- 404 模型缺失：返回 `model_not_found`，指向 `model-mapping` 配置检查。
+- 429：返回 `rate_limit_exceeded`，可附带重试等待时间，并触发多账户切换逻辑。
+- 5xx/529：返回 `service_unavailable`，可短暂重试或切换 provider。
+- 422/400：返回 `invalid_request_error`，保留 provider message 便于调试，必要时裁剪敏感信息。
+
 ---
 
 ## 十一、实现检查清单

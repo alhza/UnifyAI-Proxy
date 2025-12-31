@@ -22,6 +22,11 @@ UnifyAI Proxy 参考了 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyA
 | [10-Tool-Calling格式详解](./10-Tool-Calling格式详解.md) | Function Calling 格式转换、流式处理 |
 | [11-OAuth认证流程详解](./11-OAuth认证流程详解.md) | PKCE、Token 管理、各 Provider OAuth 实现 |
 | [12-实现路线图](./12-实现路线图.md) | 分阶段实现计划、核心数据结构、部署配置 |
+| [14-架构设计分析](./14-架构设计分析.md) | 架构分层、设计模式与扩展性分析 |
+| [15-任务拆解-基础设计](./15-任务拆解-基础设计.md) | 全局基础设计、接口契约、配置字段定义 |
+| [16-任务A-网关与配置安全](./16-任务A-网关与配置安全.md) | 网关/中间件/配置/管理端与安全 |
+| [17-任务B-认证账户与配额](./17-任务B-认证账户与配额.md) | OAuth/账户状态机/配额与调度 |
+| [18-任务C-协议转换与Provider适配](./18-任务C-协议转换与Provider适配.md) | 协议转换/Provider 适配/流式与 Tool Calling |
 
 ## 核心价值
 
