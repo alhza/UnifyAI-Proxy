@@ -403,6 +403,66 @@ func (t *GeminiTransformer) TransformStreamEvent(event interface{}) (*OpenAIStre
 	return chunk, nil
 }
 
+// NewStreamContext creates a new streaming context for concurrent-safe streaming
+func (t *GeminiTransformer) NewStreamContext(model string) *StreamContext {
+	return &StreamContext{
+		ID:      t.generateID(),
+		Model:   model,
+		Created: time.Now().Unix(),
+	}
+}
+
+// TransformStreamEventWithContext transforms a stream event using the provided context
+func (t *GeminiTransformer) TransformStreamEventWithContext(ctx *StreamContext, event interface{}) (*OpenAIStreamChunk, error) {
+	geminiEvent, ok := event.(*provider.GeminiResponse)
+	if !ok {
+		return nil, fmt.Errorf("invalid event type: expected *GeminiResponse")
+	}
+
+	chunk := &OpenAIStreamChunk{
+		ID:      ctx.ID,
+		Object:  "chat.completion.chunk",
+		Created: ctx.Created,
+		Model:   ctx.Model,
+		Choices: make([]Choice, 0),
+	}
+
+	for i, candidate := range geminiEvent.Candidates {
+		choice := Choice{
+			Index: i,
+			Delta: &OpenAIMessage{},
+		}
+
+		toolCallIndex := 0
+		for _, part := range candidate.Content.Parts {
+			if part.Text != "" && !part.Thought {
+				choice.Delta.Content = part.Text
+			} else if part.FunctionCall != nil {
+				argsJSON, _ := json.Marshal(part.FunctionCall.Args)
+				idx := toolCallIndex
+				choice.Delta.ToolCalls = append(choice.Delta.ToolCalls, ToolCall{
+					Index: &idx,
+					ID:    t.generateToolCallID(),
+					Type:  "function",
+					Function: FunctionCall{
+						Name:      part.FunctionCall.Name,
+						Arguments: string(argsJSON),
+					},
+				})
+				toolCallIndex++
+			}
+		}
+
+		if candidate.FinishReason != "" {
+			choice.FinishReason = t.mapFinishReason(candidate.FinishReason)
+		}
+
+		chunk.Choices = append(chunk.Choices, choice)
+	}
+
+	return chunk, nil
+}
+
 // Ensure GeminiTransformer implements Transformer interface
 var _ Transformer = (*GeminiTransformer)(nil)
 

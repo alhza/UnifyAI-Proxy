@@ -24,6 +24,7 @@ type ConfigWatcher struct {
 	mu         sync.RWMutex
 	stopCh     chan struct{}
 	watcher    *fsnotify.Watcher
+	stopOnce   sync.Once // Ensures Stop is only executed once
 }
 
 // NewConfigWatcher creates a new configuration watcher
@@ -60,9 +61,12 @@ func (cw *ConfigWatcher) Start() error {
 }
 
 // Stop stops watching for configuration changes
+// This method is safe to call multiple times
 func (cw *ConfigWatcher) Stop() {
-	close(cw.stopCh)
-	cw.watcher.Close()
+	cw.stopOnce.Do(func() {
+		close(cw.stopCh)
+		cw.watcher.Close()
+	})
 }
 
 // GetConfig returns the current configuration

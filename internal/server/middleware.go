@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -11,6 +12,24 @@ import (
 	"time"
 
 	"golang.org/x/time/rate"
+)
+
+// Middleware configuration constants
+const (
+	// DefaultRequestsPerSecond is the default rate limit if not specified
+	DefaultRequestsPerSecond = 10
+	// DefaultBurstSize is the default burst size for rate limiting
+	DefaultBurstSize = 20
+	// RateLimiterCleanupInterval is how often stale rate limiters are cleaned up
+	RateLimiterCleanupInterval = 5 * time.Minute
+	// RateLimiterStaleThreshold is how long before a rate limiter is considered stale
+	RateLimiterStaleThreshold = 10 * time.Minute
+	// CORSMaxAge is the Access-Control-Max-Age header value in seconds
+	CORSMaxAge = "86400"
+	// RetryAfterSeconds is the Retry-After header value for rate limited requests
+	RetryAfterSeconds = "1"
+	// ClientKeyHashBytes is the number of hash bytes used for client identification
+	ClientKeyHashBytes = 16
 )
 
 // RequestIDKey is the context key for request ID
@@ -41,6 +60,7 @@ func LoggingMiddleware(logger *slog.Logger) Middleware {
 }
 
 // responseWrapper wraps http.ResponseWriter to capture status code
+// and properly delegate optional interfaces like http.Flusher and http.Hijacker
 type responseWrapper struct {
 	http.ResponseWriter
 	status      int
@@ -60,6 +80,18 @@ func (w *responseWrapper) Write(b []byte) (int, error) {
 		w.WriteHeader(http.StatusOK)
 	}
 	return w.ResponseWriter.Write(b)
+}
+
+// Flush implements http.Flusher interface for streaming support
+func (w *responseWrapper) Flush() {
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+// Unwrap returns the underlying ResponseWriter, supporting http.ResponseController
+func (w *responseWrapper) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
 }
 
 // RecoveryMiddleware recovers from panics
@@ -99,7 +131,7 @@ func CORSMiddleware(allowedOrigins []string) Middleware {
 				w.Header().Set("Access-Control-Allow-Origin", origin)
 				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 				w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Request-ID")
-				w.Header().Set("Access-Control-Max-Age", "86400")
+				w.Header().Set("Access-Control-Max-Age", CORSMaxAge)
 			}
 			
 			// Handle preflight
@@ -196,10 +228,10 @@ func (rl *RateLimiter) Stop() {
 // Call Stop() when shutting down to prevent goroutine leak.
 func NewRateLimiter(requestsPerSecond float64, burstSize int) *RateLimiter {
 	if requestsPerSecond <= 0 {
-		requestsPerSecond = 10 // Default: 10 requests per second
+		requestsPerSecond = DefaultRequestsPerSecond
 	}
 	if burstSize <= 0 {
-		burstSize = 20 // Default: burst of 20
+		burstSize = DefaultBurstSize
 	}
 
 	// Use a map to track rate limiters per client
@@ -226,7 +258,7 @@ func NewRateLimiter(requestsPerSecond float64, burstSize int) *RateLimiter {
 			limiter := store.get(clientID)
 
 			if !limiter.Allow() {
-				w.Header().Set("Retry-After", "1")
+				w.Header().Set("Retry-After", RetryAfterSeconds)
 				WriteError(w, http.StatusTooManyRequests, "rate_limited", "Rate limit exceeded. Please slow down your requests.")
 				return
 			}
@@ -303,7 +335,7 @@ func (s *rateLimiterStore) updateLastSeen(clientID string) {
 // cleanupLoop removes stale rate limiters to prevent memory leaks
 // It listens for the stop signal to gracefully exit
 func (s *rateLimiterStore) cleanupLoop() {
-	ticker := time.NewTicker(5 * time.Minute)
+	ticker := time.NewTicker(RateLimiterCleanupInterval)
 	defer ticker.Stop()
 
 	for {
@@ -326,12 +358,12 @@ func (s *rateLimiterStore) stop() {
 	}
 }
 
-// cleanup removes limiters not seen in the last 10 minutes
+// cleanup removes limiters not seen recently
 func (s *rateLimiterStore) cleanup() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	threshold := time.Now().Add(-10 * time.Minute)
+	threshold := time.Now().Add(-RateLimiterStaleThreshold)
 	for clientID, lastSeen := range s.lastSeen {
 		if lastSeen.Before(threshold) {
 			delete(s.limiters, clientID)
@@ -341,14 +373,16 @@ func (s *rateLimiterStore) cleanup() {
 }
 
 // getClientIdentifier extracts client identifier from request (API key or IP)
+// API keys are hashed to prevent storing sensitive data in memory
 func getClientIdentifier(r *http.Request) string {
 	// Try to get API key first
 	authHeader := r.Header.Get("Authorization")
 	if strings.HasPrefix(authHeader, "Bearer ") {
-		return "key:" + strings.TrimPrefix(authHeader, "Bearer ")
+		apiKey := strings.TrimPrefix(authHeader, "Bearer ")
+		return "key:" + hashClientKey(apiKey)
 	}
 	if apiKey := r.Header.Get("X-API-Key"); apiKey != "" {
-		return "key:" + apiKey
+		return "key:" + hashClientKey(apiKey)
 	}
 
 	// Fall back to IP address
@@ -368,6 +402,14 @@ func getClientIdentifier(r *http.Request) string {
 
 	// Fall back to RemoteAddr
 	return "ip:" + r.RemoteAddr
+}
+
+// hashClientKey creates a SHA-256 hash of the API key for rate limiting
+// This prevents storing the raw API key in the rate limiter's memory map
+func hashClientKey(key string) string {
+	h := sha256.Sum256([]byte(key))
+	// Use first ClientKeyHashBytes bytes for a compact but unique identifier
+	return fmt.Sprintf("%x", h[:ClientKeyHashBytes])
 }
 
 // TimeoutMiddleware adds request timeout

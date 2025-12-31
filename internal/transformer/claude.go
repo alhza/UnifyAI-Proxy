@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/unifyai-proxy/unifyai-proxy/internal/provider"
@@ -13,11 +12,6 @@ import (
 // ClaudeTransformer transforms OpenAI format to/from Claude format
 type ClaudeTransformer struct {
 	defaultMaxTokens int
-	// Stream context - ensures consistent id and model across all chunks in a stream
-	streamID      string
-	streamModel   string
-	streamCreated int64
-	mu            sync.Mutex
 }
 
 // NewClaudeTransformer creates a new Claude transformer
@@ -27,30 +21,14 @@ func NewClaudeTransformer() *ClaudeTransformer {
 	}
 }
 
-// SetStreamContext sets the context for a streaming session.
-// This ensures id and model are consistent across all chunks in the stream.
-func (t *ClaudeTransformer) SetStreamContext(model string) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.streamID = fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
-	t.streamModel = model
-	t.streamCreated = time.Now().Unix()
-}
-
-// ClearStreamContext clears the streaming context after a stream completes
-func (t *ClaudeTransformer) ClearStreamContext() {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.streamID = ""
-	t.streamModel = ""
-	t.streamCreated = 0
-}
-
-// getStreamContext returns the current stream context (thread-safe)
-func (t *ClaudeTransformer) getStreamContext() (string, string, int64) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.streamID, t.streamModel, t.streamCreated
+// NewStreamContext creates a new streaming context for a request.
+// This ensures consistent id and model values across all stream chunks.
+func (t *ClaudeTransformer) NewStreamContext(model string) *StreamContext {
+	return &StreamContext{
+		ID:      fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano()),
+		Model:   model,
+		Created: time.Now().Unix(),
+	}
 }
 
 // ProviderType returns the target provider type
@@ -62,6 +40,28 @@ func (t *ClaudeTransformer) ProviderType() string {
 func (t *ClaudeTransformer) TransformRequest(req *OpenAIRequest) (interface{}, error) {
 	if req == nil {
 		return nil, ErrInvalidRequest
+	}
+
+	// Validate required fields
+	if req.Model == "" {
+		return nil, fmt.Errorf("%w: model is required", ErrInvalidRequest)
+	}
+	if len(req.Messages) == 0 {
+		return nil, fmt.Errorf("%w: messages array is required and cannot be empty", ErrInvalidRequest)
+	}
+
+	// Validate message structure
+	for i, msg := range req.Messages {
+		if msg.Role == "" {
+			return nil, fmt.Errorf("%w: message at index %d missing required 'role' field", ErrInvalidMessageFormat, i)
+		}
+		// Validate role values
+		switch msg.Role {
+		case "system", "user", "assistant", "tool":
+			// Valid roles
+		default:
+			return nil, fmt.Errorf("%w: message at index %d has invalid role '%s'", ErrInvalidMessageFormat, i, msg.Role)
+		}
 	}
 
 	claudeReq := &provider.ClaudeRequest{
@@ -412,30 +412,34 @@ func (t *ClaudeTransformer) mapStopReason(reason string) string {
 }
 
 // TransformStreamEvent transforms Claude stream event to OpenAI format
+// Deprecated: Use TransformStreamEventWithContext for concurrent-safe streaming
 func (t *ClaudeTransformer) TransformStreamEvent(event interface{}) (*OpenAIStreamChunk, error) {
-	// Get stable stream context for consistent id/model across all chunks
-	streamID, streamModel, streamCreated := t.getStreamContext()
+	// Fallback: generate context per-event (not ideal for consistency, but safe)
+	return t.TransformStreamEventWithContext(nil, event)
+}
 
+// TransformStreamEventWithContext transforms Claude stream event to OpenAI format
+// using the provided stream context for consistent id/model across all chunks.
+func (t *ClaudeTransformer) TransformStreamEventWithContext(ctx *StreamContext, event interface{}) (*OpenAIStreamChunk, error) {
 	chunk := &OpenAIStreamChunk{
-		Object:  "chat.completion.chunk",
-		Created: streamCreated,
+		Object: "chat.completion.chunk",
 	}
-	// Use stream context if set, otherwise fall back to per-chunk values
-	if streamCreated == 0 {
+
+	// Use context if provided, otherwise generate per-event values
+	if ctx != nil {
+		chunk.ID = ctx.ID
+		chunk.Model = ctx.Model
+		chunk.Created = ctx.Created
+	} else {
+		chunk.ID = fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
 		chunk.Created = time.Now().Unix()
 	}
 
 	switch e := event.(type) {
 	case *provider.ClaudeMessageStart:
-		// Use stream context id/model if set, otherwise use from event
-		if streamID != "" {
-			chunk.ID = streamID
-		} else {
+		// Use context if available, otherwise use from event
+		if ctx == nil {
 			chunk.ID = e.Message.ID
-		}
-		if streamModel != "" {
-			chunk.Model = streamModel
-		} else {
 			chunk.Model = e.Message.Model
 		}
 		chunk.Choices = []Choice{
@@ -446,9 +450,6 @@ func (t *ClaudeTransformer) TransformStreamEvent(event interface{}) (*OpenAIStre
 		}
 
 	case *provider.ClaudeContentBlockStart:
-		// Apply stream context for consistent id/model
-		chunk.ID = streamID
-		chunk.Model = streamModel
 		if e.ContentBlock.Type == "tool_use" {
 			// Tool call start - include index so clients can track multiple parallel tool calls
 			toolCallIndex := e.Index
@@ -478,9 +479,6 @@ func (t *ClaudeTransformer) TransformStreamEvent(event interface{}) (*OpenAIStre
 		}
 
 	case *provider.ClaudeContentBlockDelta:
-		// Apply stream context for consistent id/model
-		chunk.ID = streamID
-		chunk.Model = streamModel
 		if e.Delta.Type == "text_delta" {
 			chunk.Choices = []Choice{
 				{
@@ -511,9 +509,6 @@ func (t *ClaudeTransformer) TransformStreamEvent(event interface{}) (*OpenAIStre
 		}
 
 	case *provider.ClaudeMessageDelta:
-		// Apply stream context for consistent id/model
-		chunk.ID = streamID
-		chunk.Model = streamModel
 		finishReason := t.mapStopReason(e.Delta.StopReason)
 		chunk.Choices = []Choice{
 			{
@@ -537,7 +532,7 @@ func (t *ClaudeTransformer) TransformStreamEvent(event interface{}) (*OpenAIStre
 
 // Ensure ClaudeTransformer implements Transformer and StreamContextSetter interfaces
 var (
-	_ Transformer          = (*ClaudeTransformer)(nil)
-	_ StreamContextSetter  = (*ClaudeTransformer)(nil)
+	_ Transformer         = (*ClaudeTransformer)(nil)
+	_ StreamContextSetter = (*ClaudeTransformer)(nil)
 )
 

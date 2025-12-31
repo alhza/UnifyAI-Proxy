@@ -16,6 +16,7 @@ import (
 	"github.com/unifyai-proxy/unifyai-proxy/internal/auth"
 	"github.com/unifyai-proxy/unifyai-proxy/internal/config"
 	"github.com/unifyai-proxy/unifyai-proxy/internal/logging"
+	"github.com/unifyai-proxy/unifyai-proxy/internal/metrics"
 	"github.com/unifyai-proxy/unifyai-proxy/internal/provider"
 	"github.com/unifyai-proxy/unifyai-proxy/internal/server"
 	"github.com/unifyai-proxy/unifyai-proxy/internal/transformer"
@@ -45,18 +46,26 @@ func main() {
 		os.Exit(0)
 	}
 
-	// Load configuration
-	cfg, err := config.Load(*configPath)
+	// Load configuration with hot-reload support
+	configWatcher, err := config.NewConfigWatcher(*configPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
 		os.Exit(1)
 	}
+	cfg := configWatcher.GetConfig()
 
 	// Initialize logging
 	logging.SetupWithLevel(cfg.Logging.Level)
 	slog.Info("UnifyAI Proxy starting",
 		"version", Version,
 		"config", *configPath)
+
+	// Start config watcher for hot-reload
+	if err := configWatcher.Start(); err != nil {
+		slog.Warn("Failed to start config watcher, hot-reload disabled", "error", err)
+	} else {
+		slog.Info("Config hot-reload enabled")
+	}
 
 	// Initialize token store with encryption configuration
 	// In commercial mode, encryption is mandatory for security
@@ -113,16 +122,37 @@ func main() {
 	accountSelector := account.NewDefaultAccountSelector(maxRetryInterval)
 	slog.Info("Account selector initialized", "max_retry_interval", maxRetryInterval)
 
+	// Populate account selector with accounts from token manager
+	// This bridges the TokenManager (auth) and AccountSelector (routing/quota)
+	populateAccountSelector(cfg, tokenManager, accountSelector)
+
+	// Initialize metrics collection
+	metricsCollector := metrics.New()
+	slog.Info("Metrics collector initialized")
+
 	// Initialize providers and transformers with config
 	handlers := server.NewHandlersWithConfig(server.HandlersConfig{
 		MaxRequestSize:  cfg.MaxRequestSize,
 		MaxEventSize:    cfg.MaxEventSize,
 		AccountSelector: accountSelector,
+		Metrics:         metricsCollector,
 	})
 	if err := setupProviders(ctx, cfg, tokenStore, handlers); err != nil {
 		slog.Error("Failed to setup providers", "error", err)
 		os.Exit(1)
 	}
+
+	// Set up account reloader for runtime account synchronization
+	// This allows reloading accounts via POST /admin/reload-accounts
+	handlers.SetAccountReloader(func() {
+		// Reload accounts from token store
+		if err := tokenManager.LoadAllAccounts([]string{"claude", "gemini"}); err != nil {
+			slog.Warn("Failed to reload some accounts", "error", err)
+		}
+		// Clear existing accounts and repopulate
+		accountSelector.Clear()
+		populateAccountSelector(configWatcher.GetConfig(), tokenManager, accountSelector)
+	})
 
 	// Collect API keys from auth config
 	var apiKeys []string
@@ -194,6 +224,7 @@ func main() {
 
 	refreshService.Stop()
 	tokenManager.Stop()
+	configWatcher.Stop()
 	slog.Info("Shutdown complete")
 }
 
@@ -297,5 +328,35 @@ func createHTTPClient(cfg *config.Config) *http.Client {
 	return &http.Client{
 		Transport: transport,
 		Timeout:   30 * time.Second,
+	}
+}
+
+// populateAccountSelector creates Account instances from TokenManager and adds them to AccountSelector
+// This bridges token management (auth) with request routing and quota management (account)
+func populateAccountSelector(cfg *config.Config, tokenManager *auth.TokenManager, selector *account.DefaultAccountSelector) {
+	providers := []string{"claude", "gemini"}
+
+	for _, providerName := range providers {
+		// Get all account IDs for this provider from token manager
+		accountIDs := tokenManager.ListAccounts(providerName)
+
+		for _, accountID := range accountIDs {
+			// Create an Account for the selector
+			acc := account.NewAccount(accountID, providerName, accountID)
+
+			// Get quota limits from config
+			limits := cfg.GetAccountLimits(providerName, accountID)
+			acc.SetLimits(limits.Daily.Requests, limits.Daily.Tokens, limits.Rate.RPM)
+
+			// Add to selector
+			selector.AddAccount(acc)
+
+			slog.Info("Account registered for routing",
+				"provider", providerName,
+				"id", accountID,
+				"daily_requests", limits.Daily.Requests,
+				"daily_tokens", limits.Daily.Tokens,
+				"rpm", limits.Rate.RPM)
+		}
 	}
 }

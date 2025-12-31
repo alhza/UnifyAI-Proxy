@@ -18,15 +18,32 @@ type Transformer interface {
 	ProviderType() string
 }
 
+// StreamContext holds per-request streaming context to ensure consistent
+// id and model values across all chunks in a single stream.
+// This is request-scoped, not instance-scoped, to support concurrent streams.
+type StreamContext struct {
+	ID      string
+	Model   string
+	Created int64
+}
+
 // StreamContextSetter is an optional interface for transformers that need
 // to maintain state across stream events (e.g., stable ID and model name).
-// Transformers that implement this interface will have SetStreamContext called
-// before streaming begins and ClearStreamContext called after streaming ends.
+// The context is now returned from NewStreamContext and passed to TransformStreamEventWithContext
+// to support concurrent streaming requests safely.
 type StreamContextSetter interface {
-	// SetStreamContext initializes the streaming context with the model name.
+	// NewStreamContext creates a new streaming context for a request.
 	// This ensures consistent id and model values across all stream chunks.
+	// The returned context should be passed to TransformStreamEventWithContext.
+	NewStreamContext(model string) *StreamContext
+	// TransformStreamEventWithContext transforms a stream event using the provided context.
+	TransformStreamEventWithContext(ctx *StreamContext, event interface{}) (*OpenAIStreamChunk, error)
+}
+
+// Legacy interface for backward compatibility
+// Deprecated: Use StreamContextSetter with NewStreamContext instead
+type LegacyStreamContextSetter interface {
 	SetStreamContext(model string)
-	// ClearStreamContext clears the streaming context after a stream completes.
 	ClearStreamContext()
 }
 

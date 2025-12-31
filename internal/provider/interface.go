@@ -7,6 +7,29 @@ import (
 	"sync"
 )
 
+// Context keys for passing request-specific information
+type contextKey string
+
+const (
+	// ContextKeyTokenID is the context key for specifying which token/account to use
+	// When set, providers will use this token ID instead of their default
+	ContextKeyTokenID contextKey = "provider_token_id"
+)
+
+// WithTokenID returns a new context with the specified token ID
+// This allows handlers to specify which account's token should be used for a request
+func WithTokenID(ctx context.Context, tokenID string) context.Context {
+	return context.WithValue(ctx, ContextKeyTokenID, tokenID)
+}
+
+// GetTokenID extracts the token ID from context, returns empty string if not set
+func GetTokenID(ctx context.Context) string {
+	if tokenID, ok := ctx.Value(ContextKeyTokenID).(string); ok {
+		return tokenID
+	}
+	return ""
+}
+
 // Capability represents provider capabilities
 // Reference: docs/unifyai_proxy/15-任务拆解-基础设计.md
 type Capability int

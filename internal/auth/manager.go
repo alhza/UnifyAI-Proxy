@@ -175,13 +175,25 @@ func (tm *TokenManager) DeleteToken(provider, id string) error {
 }
 
 // ListAccounts returns all account IDs for a provider
+// Returns an empty slice if there's an error reading from the store
 func (tm *TokenManager) ListAccounts(provider string) []string {
+	ids, err := tm.listAccountsFromStore(provider)
+	if err != nil {
+		slog.Warn("failed to list accounts from store",
+			"provider", provider,
+			"error", err)
+		return []string{}
+	}
+	return ids
+}
+
+// ListAccountsWithError returns all account IDs for a provider with error information
+func (tm *TokenManager) ListAccountsWithError(provider string) ([]string, error) {
 	return tm.listAccountsFromStore(provider)
 }
 
-func (tm *TokenManager) listAccountsFromStore(provider string) []string {
-	ids, _ := tm.store.List(provider)
-	return ids
+func (tm *TokenManager) listAccountsFromStore(provider string) ([]string, error) {
+	return tm.store.List(provider)
 }
 
 // RefreshFunc is a function that refreshes a token
@@ -341,10 +353,17 @@ type AccountStatus struct {
 }
 
 // LoadAllAccounts loads all accounts from store for the given providers
+// Returns an error only for critical failures; individual account load failures are logged as warnings
 func (tm *TokenManager) LoadAllAccounts(providers []string) error {
+	var loadedCount, errorCount int
 	for _, provider := range providers {
 		ids, err := tm.store.List(provider)
 		if err != nil {
+			// Log the error but continue with other providers
+			slog.Warn("failed to list accounts for provider",
+				"provider", provider,
+				"error", err)
+			errorCount++
 			continue
 		}
 		for _, id := range ids {
@@ -353,9 +372,19 @@ func (tm *TokenManager) LoadAllAccounts(providers []string) error {
 					"provider", provider,
 					"id", id,
 					"error", err)
+				errorCount++
+			} else {
+				loadedCount++
 			}
 		}
 	}
+
+	if loadedCount > 0 || errorCount == 0 {
+		slog.Info("accounts loaded",
+			"loaded", loadedCount,
+			"errors", errorCount)
+	}
+
 	return nil
 }
 

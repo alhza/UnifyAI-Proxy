@@ -117,6 +117,34 @@ func (s *DefaultAccountSelector) RemoveAccount(id string) {
 	}
 }
 
+// Clear removes all accounts from the selector
+// This is useful for reloading accounts from the token store
+func (s *DefaultAccountSelector) Clear() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.accounts = make(map[string][]*Account)
+	s.currentIndex = make(map[string]int)
+}
+
+// GetAccountIDs returns all account IDs for a given provider
+// This is useful for checking which accounts are currently registered
+func (s *DefaultAccountSelector) GetAccountIDs(provider string) []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	accounts, exists := s.accounts[provider]
+	if !exists {
+		return nil
+	}
+
+	ids := make([]string, 0, len(accounts))
+	for _, acc := range accounts {
+		ids = append(ids, acc.ID)
+	}
+	return ids
+}
+
 // Pick selects an available account using round-robin strategy
 // The returned account is reserved and must be released after use by calling Release()
 func (s *DefaultAccountSelector) Pick(model, provider string) (*Account, error) {

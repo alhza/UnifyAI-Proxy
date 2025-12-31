@@ -319,10 +319,10 @@ func (q *DefaultQuotaCounter) GetUsage(acc *account.Account) (requests, tokens i
 }
 
 // QuotaManager manages quota across multiple accounts
+// Thread-safety is delegated to the underlying rateLimiter and quotaCounter implementations
 type QuotaManager struct {
 	rateLimiter  RateLimiter
 	quotaCounter QuotaCounter
-	mu           sync.RWMutex
 }
 
 // NewQuotaManager creates a new quota manager

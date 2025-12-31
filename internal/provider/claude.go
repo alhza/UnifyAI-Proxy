@@ -156,13 +156,21 @@ func (p *ClaudeProvider) OAuthConfig() OAuthConfig {
 }
 
 // GetValidToken returns a valid access token, refreshing if necessary
+// It first checks for a token ID in the context (set via WithTokenID),
+// and falls back to the provider's default tokenID if not specified.
 func (p *ClaudeProvider) GetValidToken(ctx context.Context) (string, error) {
+	// Check if a specific token ID was passed via context
+	tokenID := GetTokenID(ctx)
+	if tokenID == "" {
+		tokenID = p.tokenID // Fall back to provider's default
+	}
+
 	p.mu.RLock()
-	token, err := p.tokenStore.Load("claude", p.tokenID)
+	token, err := p.tokenStore.Load("claude", tokenID)
 	p.mu.RUnlock()
 
 	if err != nil {
-		return "", fmt.Errorf("failed to load token: %w", err)
+		return "", fmt.Errorf("failed to load token for account %q: %w", tokenID, err)
 	}
 
 	if token.IsValid() {
@@ -171,9 +179,9 @@ func (p *ClaudeProvider) GetValidToken(ctx context.Context) (string, error) {
 
 	// Token expired, try to refresh
 	if token.RefreshToken != "" {
-		newToken, err := p.RefreshToken(ctx, token.RefreshToken)
+		newToken, err := p.refreshTokenWithID(ctx, token.RefreshToken, tokenID)
 		if err != nil {
-			return "", fmt.Errorf("failed to refresh token: %w", err)
+			return "", fmt.Errorf("failed to refresh token for account %q: %w", tokenID, err)
 		}
 		return newToken.AccessToken, nil
 	}
@@ -181,8 +189,8 @@ func (p *ClaudeProvider) GetValidToken(ctx context.Context) (string, error) {
 	return "", ErrTokenExpired
 }
 
-// RefreshToken refreshes the OAuth token
-func (p *ClaudeProvider) RefreshToken(ctx context.Context, refreshToken string) (*TokenResponse, error) {
+// refreshTokenWithID refreshes the OAuth token for a specific token ID
+func (p *ClaudeProvider) refreshTokenWithID(ctx context.Context, refreshToken, tokenID string) (*TokenResponse, error) {
 	data := url.Values{}
 	data.Set("grant_type", "refresh_token")
 	data.Set("refresh_token", refreshToken)
@@ -213,7 +221,7 @@ func (p *ClaudeProvider) RefreshToken(ctx context.Context, refreshToken string) 
 		return nil, fmt.Errorf("failed to decode token response: %w", err)
 	}
 
-	// Save the new token
+	// Save the new token with the specified token ID
 	p.mu.Lock()
 	newToken := &auth.Token{
 		AccessToken:  tokenResp.AccessToken,
@@ -221,13 +229,18 @@ func (p *ClaudeProvider) RefreshToken(ctx context.Context, refreshToken string) 
 		ExpiresAt:    time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second),
 		TokenType:    tokenResp.TokenType,
 	}
-	if err := p.tokenStore.Save("claude", p.tokenID, newToken); err != nil {
+	if err := p.tokenStore.Save("claude", tokenID, newToken); err != nil {
 		p.mu.Unlock()
 		return nil, fmt.Errorf("failed to save new token: %w", err)
 	}
 	p.mu.Unlock()
 
 	return &tokenResp, nil
+}
+
+// RefreshToken refreshes the OAuth token using the provider's default token ID
+func (p *ClaudeProvider) RefreshToken(ctx context.Context, refreshToken string) (*TokenResponse, error) {
+	return p.refreshTokenWithID(ctx, refreshToken, p.tokenID)
 }
 
 // SendRequest sends a synchronous request to Claude API
@@ -377,7 +390,7 @@ func (p *ClaudeProvider) handleErrorResponse(resp *http.Response) error {
 		}
 	}
 
-	return fmt.Errorf("Claude API error (status %d): %s", resp.StatusCode, string(body))
+	return fmt.Errorf("claude API error (status %d): %s", resp.StatusCode, string(body))
 }
 
 // SSE Scanner buffer constants
@@ -403,7 +416,11 @@ func (p *ClaudeProvider) processSSEStream(ctx context.Context, body io.ReadClose
 	for scanner.Scan() {
 		select {
 		case <-ctx.Done():
-			eventCh <- StreamEvent{Type: StreamEventTypeError, Error: ctx.Err()}
+			// Use non-blocking send to avoid deadlock if channel is full
+			select {
+			case eventCh <- StreamEvent{Type: StreamEventTypeError, Error: ctx.Err()}:
+			default:
+			}
 			return
 		default:
 		}
@@ -435,7 +452,11 @@ func (p *ClaudeProvider) processSSEStream(ctx context.Context, body io.ReadClose
 	}
 
 	if err := scanner.Err(); err != nil {
-		eventCh <- StreamEvent{Type: StreamEventTypeError, Error: err}
+		// Use non-blocking send for scanner error as well
+		select {
+		case eventCh <- StreamEvent{Type: StreamEventTypeError, Error: err}:
+		default:
+		}
 	}
 }
 

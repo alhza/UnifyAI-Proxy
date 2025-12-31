@@ -152,13 +152,21 @@ func (p *GeminiProvider) OAuthConfig() OAuthConfig {
 }
 
 // GetValidToken returns a valid access token, refreshing if necessary
+// It first checks for a token ID in the context (set via WithTokenID),
+// and falls back to the provider's default tokenID if not specified.
 func (p *GeminiProvider) GetValidToken(ctx context.Context) (string, error) {
+	// Check if a specific token ID was passed via context
+	tokenID := GetTokenID(ctx)
+	if tokenID == "" {
+		tokenID = p.tokenID // Fall back to provider's default
+	}
+
 	p.mu.RLock()
-	token, err := p.tokenStore.Load("gemini", p.tokenID)
+	token, err := p.tokenStore.Load("gemini", tokenID)
 	p.mu.RUnlock()
 
 	if err != nil {
-		return "", fmt.Errorf("failed to load token: %w", err)
+		return "", fmt.Errorf("failed to load token for account %q: %w", tokenID, err)
 	}
 
 	if token.IsValid() {
@@ -166,9 +174,9 @@ func (p *GeminiProvider) GetValidToken(ctx context.Context) (string, error) {
 	}
 
 	if token.RefreshToken != "" {
-		newToken, err := p.RefreshToken(ctx, token.RefreshToken)
+		newToken, err := p.refreshTokenWithID(ctx, token.RefreshToken, tokenID)
 		if err != nil {
-			return "", fmt.Errorf("failed to refresh token: %w", err)
+			return "", fmt.Errorf("failed to refresh token for account %q: %w", tokenID, err)
 		}
 		return newToken.AccessToken, nil
 	}
@@ -176,8 +184,8 @@ func (p *GeminiProvider) GetValidToken(ctx context.Context) (string, error) {
 	return "", ErrTokenExpired
 }
 
-// RefreshToken refreshes the OAuth token
-func (p *GeminiProvider) RefreshToken(ctx context.Context, refreshToken string) (*TokenResponse, error) {
+// refreshTokenWithID refreshes the OAuth token for a specific token ID
+func (p *GeminiProvider) refreshTokenWithID(ctx context.Context, refreshToken, tokenID string) (*TokenResponse, error) {
 	data := url.Values{}
 	data.Set("grant_type", "refresh_token")
 	data.Set("refresh_token", refreshToken)
@@ -208,7 +216,7 @@ func (p *GeminiProvider) RefreshToken(ctx context.Context, refreshToken string) 
 		return nil, fmt.Errorf("failed to decode token response: %w", err)
 	}
 
-	// Save the new token
+	// Save the new token with the specified token ID
 	p.mu.Lock()
 	newToken := &auth.Token{
 		AccessToken:  tokenResp.AccessToken,
@@ -219,13 +227,18 @@ func (p *GeminiProvider) RefreshToken(ctx context.Context, refreshToken string) 
 	if newToken.RefreshToken == "" {
 		newToken.RefreshToken = refreshToken // Keep old refresh token if not returned
 	}
-	if err := p.tokenStore.Save("gemini", p.tokenID, newToken); err != nil {
+	if err := p.tokenStore.Save("gemini", tokenID, newToken); err != nil {
 		p.mu.Unlock()
 		return nil, fmt.Errorf("failed to save new token: %w", err)
 	}
 	p.mu.Unlock()
 
 	return &tokenResp, nil
+}
+
+// RefreshToken refreshes the OAuth token using the provider's default token ID
+func (p *GeminiProvider) RefreshToken(ctx context.Context, refreshToken string) (*TokenResponse, error) {
+	return p.refreshTokenWithID(ctx, refreshToken, p.tokenID)
 }
 
 // SendRequest sends a synchronous request to Gemini API
@@ -364,7 +377,7 @@ func (p *GeminiProvider) handleErrorResponse(resp *http.Response) error {
 		}
 	}
 
-	return fmt.Errorf("Gemini API error (status %d): %s", resp.StatusCode, string(body))
+	return fmt.Errorf("gemini API error (status %d): %s", resp.StatusCode, string(body))
 }
 
 // SSE Scanner buffer constants for Gemini
@@ -388,7 +401,11 @@ func (p *GeminiProvider) processSSEStream(ctx context.Context, body io.ReadClose
 	for scanner.Scan() {
 		select {
 		case <-ctx.Done():
-			eventCh <- StreamEvent{Type: StreamEventTypeError, Error: ctx.Err()}
+			// Use non-blocking send to avoid deadlock if channel is full
+			select {
+			case eventCh <- StreamEvent{Type: StreamEventTypeError, Error: ctx.Err()}:
+			default:
+			}
 			return
 		default:
 		}
@@ -428,7 +445,11 @@ func (p *GeminiProvider) processSSEStream(ctx context.Context, body io.ReadClose
 	}
 
 	if err := scanner.Err(); err != nil {
-		eventCh <- StreamEvent{Type: StreamEventTypeError, Error: err}
+		// Use non-blocking send for scanner error as well
+		select {
+		case eventCh <- StreamEvent{Type: StreamEventTypeError, Error: err}:
+		default:
+		}
 	}
 }
 

@@ -11,18 +11,29 @@ import (
 	"github.com/unifyai-proxy/unifyai-proxy/internal/transformer"
 )
 
+// SSE stream configuration defaults
+const (
+	// DefaultKeepalive is the default keepalive interval for SSE streams
+	DefaultKeepalive = 30 * time.Second
+	// DefaultBufferSize is the default event buffer size
+	DefaultBufferSize = 100
+	// Note: DefaultMaxEventSize is defined in writer.go
+)
+
 // StreamHandler handles streaming responses from providers
 type StreamHandler struct {
-	transformer  transformer.Transformer
-	keepalive    time.Duration
-	maxEventSize int
+	transformer   transformer.Transformer
+	streamContext *transformer.StreamContext
+	keepalive     time.Duration
+	maxEventSize  int
 }
 
 // StreamHandlerConfig contains configuration for StreamHandler
 type StreamHandlerConfig struct {
-	Transformer  transformer.Transformer
-	Keepalive    time.Duration
-	MaxEventSize int
+	Transformer   transformer.Transformer
+	StreamContext *transformer.StreamContext
+	Keepalive     time.Duration
+	MaxEventSize  int
 }
 
 // NewStreamHandler creates a new stream handler
@@ -37,9 +48,10 @@ func NewStreamHandler(t transformer.Transformer, keepalive time.Duration) *Strea
 // NewStreamHandlerWithConfig creates a new stream handler with full configuration
 func NewStreamHandlerWithConfig(cfg StreamHandlerConfig) *StreamHandler {
 	return &StreamHandler{
-		transformer:  cfg.Transformer,
-		keepalive:    cfg.Keepalive,
-		maxEventSize: cfg.MaxEventSize,
+		transformer:   cfg.Transformer,
+		streamContext: cfg.StreamContext,
+		keepalive:     cfg.Keepalive,
+		maxEventSize:  cfg.MaxEventSize,
 	}
 }
 
@@ -100,7 +112,16 @@ func (h *StreamHandler) handleEvent(w *Writer, event *provider.StreamEvent) erro
 	case provider.StreamEventTypeData, provider.StreamEventTypeToolCall, provider.StreamEventTypeThinking:
 		// Transform to OpenAI format
 		if h.transformer != nil && event.Data != nil {
-			chunk, err := h.transformer.TransformStreamEvent(event.Data)
+			var chunk *transformer.OpenAIStreamChunk
+			var err error
+
+			// Use context-aware transformation if available
+			if setter, ok := h.transformer.(transformer.StreamContextSetter); ok && h.streamContext != nil {
+				chunk, err = setter.TransformStreamEventWithContext(h.streamContext, event.Data)
+			} else {
+				chunk, err = h.transformer.TransformStreamEvent(event.Data)
+			}
+
 			if err != nil {
 				return fmt.Errorf("transform error: %w", err)
 			}
@@ -131,9 +152,9 @@ type StreamConfig struct {
 // DefaultStreamConfig returns the default stream configuration
 func DefaultStreamConfig() StreamConfig {
 	return StreamConfig{
-		Keepalive:       30 * time.Second,
-		BufferSize:      100,
-		MaxEventSize:    1024 * 1024, // 1MB
+		Keepalive:       DefaultKeepalive,
+		BufferSize:      DefaultBufferSize,
+		MaxEventSize:    DefaultMaxEventSize,
 		IncludeUsage:    true,
 		TransformEvents: true,
 	}
@@ -147,10 +168,25 @@ func ProxyStream(
 	t transformer.Transformer,
 	config StreamConfig,
 ) error {
+	return ProxyStreamWithContext(ctx, w, eventCh, t, nil, config)
+}
+
+// ProxyStreamWithContext proxies a streaming response with explicit stream context
+// for concurrent-safe streaming. The streamCtx parameter ensures consistent
+// id/model values across all chunks in the stream.
+func ProxyStreamWithContext(
+	ctx context.Context,
+	w http.ResponseWriter,
+	eventCh <-chan provider.StreamEvent,
+	t transformer.Transformer,
+	streamCtx *transformer.StreamContext,
+	config StreamConfig,
+) error {
 	handler := NewStreamHandlerWithConfig(StreamHandlerConfig{
-		Transformer:  t,
-		Keepalive:    config.Keepalive,
-		MaxEventSize: config.MaxEventSize,
+		Transformer:   t,
+		StreamContext: streamCtx,
+		Keepalive:     config.Keepalive,
+		MaxEventSize:  config.MaxEventSize,
 	})
 	return handler.HandleStream(ctx, w, eventCh)
 }
